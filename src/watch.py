@@ -1,8 +1,11 @@
 """每日阅读自动化"""
 import time
 import random
+import json
+import requests
+import urllib.parse
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-from utils import get_all_cookies, create_browser_context, claim_rewards, init_localstorage
+from utils import get_all_cookies, create_browser_context, claim_rewards, init_localstorage, extract_user_info_from_cookies
 
 # 配置
 MAX_RETRIES = 3
@@ -12,6 +15,159 @@ COMIC_WATCH_MINUTES = 12  # 观看时长（分钟）
 INVALID_KEYWORDS = ['不存在', '已被删除', '找不到该漫画', '已下架']
 # 付费/VIP 关键词
 PAYWALL_KEYWORDS = ['付费', 'VIP专属', '开通会员', '购买章节', '解锁章节']
+
+# API 端点
+IAPI_BASE = 'https://i.zaimanhua.com'
+READING_RECORD_API = 'https://manhua.zaimanhua.com/app/v1/readingRecord/add'
+
+# 存储捕获的 API 请求
+captured_api_calls = []
+
+
+def setup_request_interception(page):
+    """设置请求拦截以捕获阅读历史 API 调用"""
+    def handle_request(request):
+        url = request.url
+        # 捕获发送到 i.zaimanhua.com 的请求
+        if 'i.zaimanhua.com' in url or 'zaimanhua.com/api' in url:
+            captured_api_calls.append({
+                'url': url,
+                'method': request.method,
+                'post_data': request.post_data,
+                'headers': dict(request.headers) if request.headers else {}
+            })
+            print(f"  [API] {request.method} {url}")
+
+    page.on('request', handle_request)
+
+
+def extract_comic_info_from_url(url):
+    """从 URL 中提取漫画 ID 和章节 ID
+
+    URL 格式: /view/comic-name/comic_id/chapter_id
+    例如: /view/wentixueshengjiejuebu/69384/163999
+    """
+    comic_id = None
+    chapter_id = None
+    comic_py = None
+
+    if '/view/' in url:
+        # 阅读页面: /view/comic-name/comic_id/chapter_id
+        parts = url.split('/view/')[-1].rstrip('/').split('/')
+        if len(parts) >= 3:
+            comic_py = parts[0]  # 漫画拼音名
+            comic_id = parts[1]  # 数字 ID (bizId)
+            chapter_id = parts[2].replace('.html', '')  # 章节 ID
+        elif len(parts) == 2:
+            comic_py = parts[0]
+            chapter_id = parts[1].replace('.html', '')
+    elif '/info/' in url:
+        # 详情页面: /info/comic-name.html
+        comic_py = url.split('/info/')[-1].replace('.html', '').rstrip('/')
+
+    return comic_id, chapter_id, comic_py
+
+
+def save_reading_history(cookie_str, comic_id, chapter_id, page_num=1):
+    """调用 API 保存阅读历史
+
+    使用发现的 API 端点:
+    POST https://manhua.zaimanhua.com/app/v1/readingRecord/add?source=mh&json=[{"bizId":comic_id,"chapterId":chapter_id,"page":1}]
+
+    需要 Authorization: Bearer <token> 头
+    """
+    if not comic_id or not chapter_id:
+        return False
+
+    try:
+        comic_id_int = int(comic_id)
+        chapter_id_int = int(chapter_id)
+    except ValueError:
+        print(f"  警告: comic_id={comic_id} 或 chapter_id={chapter_id} 不是数字")
+        return False
+
+    # 从 cookie 中提取 token
+    user_info = extract_user_info_from_cookies(cookie_str)
+    token = user_info.get('token')
+
+    # 如果没有从 user_info 获取到 token，直接从 cookie 中查找
+    if not token:
+        for item in cookie_str.split(';'):
+            item = item.strip()
+            if item.startswith('token='):
+                token = item[6:]
+                break
+
+    if not token:
+        print("  警告: 无法获取 token，跳过历史保存")
+        return False
+
+    # 构建 JSON 参数
+    json_data = json.dumps([{
+        "bizId": comic_id_int,
+        "chapterId": chapter_id_int,
+        "page": page_num
+    }])
+
+    # 构建完整 URL
+    url = f"{READING_RECORD_API}?source=mh&json={urllib.parse.quote(json_data)}"
+
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://www.zaimanhua.com',
+        'Referer': 'https://www.zaimanhua.com/',
+        'Authorization': f'Bearer {token}',
+        'platform': 'pc',
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            result = resp.json() if resp.text else {}
+            if result.get('errno') == 0 or 'errno' not in result:
+                print(f"  [历史] 已保存阅读记录: bizId={comic_id}, chapterId={chapter_id}")
+                return True
+            else:
+                print(f"  [历史] API 返回错误: {result.get('errmsg', result)}")
+                return False
+        else:
+            print(f"  [历史] 保存失败: {resp.status_code} - {resp.text[:100] if resp.text else ''}")
+            return False
+    except Exception as e:
+        print(f"  [历史] API 调用出错: {e}")
+        return False
+
+
+def save_reading_history_via_page(page, comic_id, chapter_id):
+    """通过页面 JavaScript 保存阅读历史（利用网站自身的机制）"""
+    try:
+        # 尝试直接调用 localStorage 保存
+        script = f'''
+        (() => {{
+            try {{
+                const historyKey = 'reading_history';
+                let history = JSON.parse(localStorage.getItem(historyKey) || '[]');
+                const record = {{
+                    comic_id: "{comic_id}",
+                    chapter_id: "{chapter_id}",
+                    timestamp: Date.now()
+                }};
+                // 去重并添加
+                history = history.filter(h => h.comic_id !== "{comic_id}");
+                history.unshift(record);
+                history = history.slice(0, 100);
+                localStorage.setItem(historyKey, JSON.stringify(history));
+                return true;
+            }} catch (e) {{
+                return false;
+            }}
+        }})()
+        '''
+        result = page.evaluate(script)
+        return result
+    except Exception as e:
+        print(f"  保存本地历史失败: {e}")
+        return False
 
 
 def safe_goto(page, url, timeout=30000, retries=2):
@@ -137,6 +293,9 @@ def watch_comic(page, cookie_str, minutes=12):
     """观看漫画指定时长"""
     print(f"\n=== 观看漫画任务 ({minutes}分钟) ===")
     try:
+        # 设置请求拦截以捕获 API 调用
+        setup_request_interception(page)
+
         # 访问首页获取漫画链接
         print("访问首页获取漫画链接...")
         if not safe_goto(page, 'https://www.zaimanhua.com/', timeout=45000):
@@ -279,6 +438,13 @@ def watch_comic(page, cookie_str, minutes=12):
                     comics_read += 1
                     failed_comics = 0  # 重置失败计数
                     print(f"  [有效] 开始阅读漫画 {comics_read}")
+
+                    # 保存阅读历史
+                    comic_id, chapter_id, _ = extract_comic_info_from_url(chapter_url)
+                    if comic_id and chapter_id:
+                        save_reading_history(cookie_str, comic_id, chapter_id)
+                        save_reading_history_via_page(page, comic_id, chapter_id)
+
                     break
                 except PlaywrightTimeout:
                     print(f"    章节访问超时")
@@ -352,6 +518,12 @@ def watch_comic(page, cookie_str, minutes=12):
 
                                 # 重新设置 localStorage
                                 check_login_status(page, cookie_str)
+
+                                # 保存新章节的阅读历史
+                                new_comic_id, new_chapter_id, _ = extract_comic_info_from_url(page.url)
+                                if new_comic_id and new_chapter_id:
+                                    save_reading_history(cookie_str, new_comic_id, new_chapter_id)
+                                    save_reading_history_via_page(page, new_comic_id, new_chapter_id)
                             else:
                                 print(f"  >> 下一章无效 ({status})，继续当前章节")
                         except Exception as e:
@@ -361,6 +533,17 @@ def watch_comic(page, cookie_str, minutes=12):
         print("\n触发阅读记录同步...")
         safe_goto(page, 'https://www.zaimanhua.com/', timeout=30000)
         page.wait_for_timeout(2000)
+
+        # 访问用户中心确保历史同步
+        print("访问用户中心同步历史...")
+        safe_goto(page, 'https://i.zaimanhua.com/history', timeout=30000)
+        page.wait_for_timeout(3000)
+
+        # 输出捕获的 API 调用（用于调试）
+        if captured_api_calls:
+            print(f"\n捕获到 {len(captured_api_calls)} 个 API 调用:")
+            for call in captured_api_calls[:10]:  # 只显示前10个
+                print(f"  {call['method']} {call['url']}")
 
         print(f"\n观看任务完成！已阅读 {elapsed_total//60}分钟，翻页 {pages_turned}，翻章 {chapters_turned}，漫画 {comics_read}部")
         return comics_read > 0

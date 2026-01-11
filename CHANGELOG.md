@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.2.2] - 2026-01-11
+
+### Fixed
+
+- 修复阅读历史不同步问题 (`src/watch.py`)
+  - 发现正确的 API 端点: `POST /app/v1/readingRecord/add`
+  - 使用 `Authorization: Bearer <token>` 头进行认证
+  - 在进入章节和翻章时主动调用 API 保存阅读进度
+  - 添加请求拦截以捕获和调试 API 调用
+
 ## [1.2.1] - 2026-01-11
 
 ### Changed
