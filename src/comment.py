@@ -57,6 +57,35 @@ def save_commented_comic(comic_id):
 def post_daily_comment(page, cookie_str):
     """发表每日评论"""
     print("\n=== 每日评论任务 ===")
+    
+    # 预检查：手机绑定状态和任务状态
+    user_info = extract_user_info_from_cookies(cookie_str)
+    token = user_info.get('token')
+    
+    # 检查任务是否已完成
+    if token:
+        print("检查当前任务状态...")
+        task_result = get_task_list(token)
+        if task_result and task_result.get('errno') == 0:
+            tasks = extract_tasks_from_response(task_result)
+            for task in tasks:
+                task_id = task.get('id') or task.get('taskId')
+                if task_id == 14:
+                    if task.get('status') == 3:
+                        print("  评论任务已完成，无需再次评论")
+                        return True
+                    break
+    
+    # 检查手机绑定
+    phone_bound = user_info.get('bind_phone')
+    # bind_phone 可能是实际号码(188****8888)或空/0
+    is_bound = phone_bound and str(phone_bound) not in ['0', '', 'None', 'False']
+    
+    if not is_bound:
+        print(f"警告: 检测到当前账号未绑定手机号 (bind_phone={phone_bound})")
+        print("注意: 未绑定手机号的账号无法完成评论任务。为了避免工作流失败，将跳过此任务。")
+        return True
+
     try:
         # 获取已评论的漫画
         commented_comics = get_commented_comics()
