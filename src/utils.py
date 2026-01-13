@@ -174,7 +174,8 @@ def extract_tasks_from_response(task_result):
 
     任务状态值:
     - status=1: 未完成
-    - status=3: 已完成（可领取或已领取）
+    - status=2: 可领取（任务已完成，等待领取奖励）
+    - status=3: 已完成（奖励已领取）
     """
     if not task_result or task_result.get('errno') != 0:
         return []
@@ -238,8 +239,8 @@ def print_task_status(cookie_str, label=""):
                     task_desc = task.get('desc', '')
                     status = task.get('status', '?')
 
-                    # 状态说明: 1=未完成, 3=已完成
-                    status_desc = {1: '未完成', 2: '进行中', 3: '已完成'}.get(status, f'未知({status})')
+                    # 状态说明: 1=未完成, 2=可领取, 3=已完成
+                    status_desc = {1: '未完成', 2: '可领取', 3: '已完成'}.get(status, f'未知({status})')
 
                     # 获取奖励信息
                     currency = task.get('currency', {})
@@ -269,41 +270,57 @@ def claim_task_reward(token, task_id):
         'Content-Type': 'application/json',
     }
 
-    # 尝试多种可能的领取 API
-    claim_urls = [
-        f'https://i.zaimanhua.com/lpi/v1/task/receive?taskId={task_id}',
-        f'https://i.zaimanhua.com/lpi/v1/task/claim?taskId={task_id}',
-        f'https://i.zaimanhua.com/lpi/v1/task/get_reward?taskId={task_id}',
+    last_result = None
+
+    # 尝试多种 API 端点和参数组合
+    # 组合 1: POST 请求 + JSON body（最常见的 RESTful 风格）
+    json_body_endpoints = [
+        'https://i.zaimanhua.com/lpi/v1/task/receive',
+        'https://i.zaimanhua.com/lpi/v1/task/claim',
+        'https://i.zaimanhua.com/lpi/v1/task/get_reward',
     ]
 
-    last_result = None
-    for url in claim_urls:
-        try:
-            # 尝试 POST 请求
-            resp = requests.post(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get('errno') == 0 or result.get('code') == 0:
-                    return True, result
-                # 如果接口返回错误但是是"已领取"类型的错误，也算成功
-                errmsg = result.get('errmsg', '') or result.get('message', '')
-                if '已领取' in errmsg or '已完成' in errmsg:
-                    return True, result
-                last_result = result
+    # 尝试不同的参数名: id, taskId, task_id
+    param_names = ['id', 'taskId', 'task_id']
 
-            # 尝试 GET 请求
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                result = resp.json()
-                if result.get('errno') == 0 or result.get('code') == 0:
-                    return True, result
-                errmsg = result.get('errmsg', '') or result.get('message', '')
-                if '已领取' in errmsg or '已完成' in errmsg:
-                    return True, result
-                last_result = result
-        except Exception as e:
-            last_result = {'errmsg': str(e)}
-            continue
+    for url in json_body_endpoints:
+        for param_name in param_names:
+            try:
+                json_body = {param_name: task_id}
+                resp = requests.post(url, headers=headers, json=json_body, timeout=10)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if result.get('errno') == 0 or result.get('code') == 0:
+                        return True, result
+                    errmsg = result.get('errmsg', '') or result.get('message', '')
+                    if '已领取' in errmsg or '已完成' in errmsg:
+                        return True, result
+                    last_result = result
+            except Exception as e:
+                last_result = {'errmsg': str(e)}
+                continue
+
+    # 组合 2: GET 请求 + query string（旧版兼容）
+    for param_name in param_names:
+        query_urls = [
+            f'https://i.zaimanhua.com/lpi/v1/task/receive?{param_name}={task_id}',
+            f'https://i.zaimanhua.com/lpi/v1/task/claim?{param_name}={task_id}',
+            f'https://i.zaimanhua.com/lpi/v1/task/get_reward?{param_name}={task_id}',
+        ]
+        for url in query_urls:
+            try:
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    result = resp.json()
+                    if result.get('errno') == 0 or result.get('code') == 0:
+                        return True, result
+                    errmsg = result.get('errmsg', '') or result.get('message', '')
+                    if '已领取' in errmsg or '已完成' in errmsg:
+                        return True, result
+                    last_result = result
+            except Exception as e:
+                last_result = {'errmsg': str(e)}
+                continue
 
     return False, last_result
 
@@ -315,7 +332,8 @@ def claim_rewards(page, cookie_str=None):
 
     任务状态值:
     - status=1: 未完成
-    - status=3: 已完成（可领取）
+    - status=2: 可领取（任务已完成，等待领取奖励）
+    - status=3: 已完成（奖励已领取）
     """
     print("\n=== 领取积分任务 ===")
 
@@ -349,12 +367,12 @@ def claim_rewards(page, cookie_str=None):
                 task_name = task.get('title') or task.get('name') or task.get('taskName', '未知任务')
                 status = task.get('status', 0)
 
-                # 状态说明: status=3 表示已完成可领取
-                # 注意: 这里的逻辑可能需要根据实际情况调整
-                # 目前假设 status=3 的任务可以尝试领取
-                if status == 3:
+                # 状态说明:
+                # - status=2: 可领取（任务已完成，等待领取奖励）
+                # - status=3: 已完成（奖励已领取）
+                if status == 2:
                     claimable_count += 1
-                    print(f"  发现已完成任务: {task_name} (ID: {task_id}, status={status})")
+                    print(f"  发现可领取任务: {task_name} (ID: {task_id}, status={status})")
 
                     if task_id:
                         success, result = claim_task_reward(token, task_id)
@@ -362,7 +380,9 @@ def claim_rewards(page, cookie_str=None):
                             print(f"    [OK] 领取成功")
                             claimed_count += 1
                         else:
-                            print(f"    [SKIP] 领取失败或已领取")
+                            print(f"    [FAIL] 领取失败")
+                elif status == 3:
+                    print(f"  任务已领取: {task_name} (ID: {task_id}, status={status})")
                 elif status == 1:
                     print(f"  任务未完成: {task_name} (ID: {task_id}, status={status})")
 
